@@ -1,0 +1,5 @@
+[language-server.rust-analyzer.config]
+
+[[language]]
+name = "rust"
+auto-format = true

@@ -1,0 +1,5 @@
+# Default location of the trunk-built frontend embedded into the binary.
+# An already-set FRONTEND_DIST environment variable (e.g. from the nix
+# build) takes precedence over this value.
+[env]
+FRONTEND_DIST = { value = "../athenut-frontend/dist", relative = true }

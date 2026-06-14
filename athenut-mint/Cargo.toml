@@ -1,0 +1,45 @@
+[package]
+name = "athenut-mint"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+anyhow = "1"
+axum = "0.8.1"
+clap = { version = "4.4.8", features = ["derive", "env", "default"] }
+bitcoin = { version= "0.32.2", features = ["base64", "serde", "rand", "rand-std"] }
+bip39 = "2.0"
+cdk = { version = "=0.17.0", default-features = false, features = ["mint", "wallet"] }
+cdk-common = { version = "=0.17.0", default-features = false, features = ["mint", "wallet"] }
+cdk-sqlite = { version = "=0.17.0", default-features = false, features = ["mint", "wallet"] }
+cdk-axum = { version = "=0.17.0", default-features = false }
+config = { version = "0.13.3", features = ["toml"] }
+tracing = { version = "0.1", default-features = false, features = ["attributes", "log"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tokio = { version = "1", default-features = false, features = ["signal"] }
+tokio-util = { version = "0.7.11", default-features = false }
+tower-http = { version = "0.6.2", features = ["cors"] }
+home = "0.5.5"
+serde = { version = "1", default-features = false, features = ["derive"] }
+futures = { version = "0.3.28", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "rustls-tls-native-roots",
+    "socks",
+]}
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+nostr-sdk = { version = "0.35.0", features = ["nip59"] }
+serde_json = "1.0.132"
+cln-rpc = "0.3.0"
+futures-core = "0.3.32"
+async-stream = "0.3"
+rand = "0.8"
+hex = "0.4"
+base64 = "0.22"
+sha2 = "0.10"
+lightning-invoice = "0.34"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"

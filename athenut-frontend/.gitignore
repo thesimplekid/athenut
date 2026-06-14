@@ -1,0 +1,5 @@
+.env
+/target
+/dist
+/result
+.DS_Store

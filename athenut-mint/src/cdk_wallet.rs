@@ -1,0 +1,583 @@
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_stream::stream;
+use async_trait::async_trait;
+use cdk::nuts::CurrencyUnit;
+use cdk::nuts::PaymentMethod;
+use cdk::wallet::Wallet;
+use cdk::Amount;
+use cdk_common::amount::SplitTarget;
+use cdk_sqlite::WalletSqliteDatabase;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use futures_core::Stream;
+use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use cdk_common::nuts::CurrencyUnit as CommonCurrencyUnit;
+use cdk_common::payment::{
+    Bolt11Settings, CreateIncomingPaymentResponse, Event, IncomingPaymentOptions,
+    MakePaymentResponse, MintPayment, OutgoingPaymentOptions, PaymentIdentifier,
+    PaymentQuoteResponse, SettingsResponse, WaitPaymentResponse,
+};
+use cdk_common::Amount as CommonAmount;
+use serde::Deserialize;
+use serde::Serialize;
+use uuid::Uuid;
+
+use crate::{XSR_COMMON_UNIT, XSR_UNIT};
+
+const KV_PRIMARY_NAMESPACE: &str = "athenut";
+const KV_SECONDARY_NAMESPACE: &str = "incoming_payment";
+const MINT_QUOTE_WAIT_TIMEOUT: Duration = Duration::from_secs(500);
+
+#[derive(Serialize, Deserialize)]
+struct IncomingPaymentInfo {
+    cost_sats: u64,
+    amount_xsr: u64,
+}
+
+pub struct CashuWalletBackend {
+    wallet: Arc<Wallet>,
+    wait_invoice_active: Arc<AtomicBool>,
+    pending_mint_tx: mpsc::UnboundedSender<JoinHandle<Option<WaitPaymentResponse>>>,
+    pending_mint_rx:
+        std::sync::Mutex<Option<mpsc::UnboundedReceiver<JoinHandle<Option<WaitPaymentResponse>>>>>,
+    kagi_auth_token: String,
+    cost_per_xsr_cents: u64,
+}
+
+impl CashuWalletBackend {
+    pub async fn new(
+        mint_url: &str,
+        mnemonic: &str,
+        home_dir: &Path,
+        kagi_auth_token: &str,
+        cost_per_xsr_cents: u64,
+    ) -> anyhow::Result<Self> {
+        let wallet = create_backing_wallet(mint_url, mnemonic, home_dir).await?;
+        Ok(Self::with_wallet(
+            wallet,
+            kagi_auth_token,
+            cost_per_xsr_cents,
+        ))
+    }
+
+    /// Create a CashuWalletBackend using an existing shared wallet.
+    pub fn with_wallet(
+        wallet: Arc<Wallet>,
+        kagi_auth_token: &str,
+        cost_per_xsr_cents: u64,
+    ) -> Self {
+        let (pending_mint_tx, pending_mint_rx) = mpsc::unbounded_channel();
+
+        Self {
+            wallet,
+            wait_invoice_active: Arc::new(AtomicBool::new(false)),
+            pending_mint_tx,
+            pending_mint_rx: std::sync::Mutex::new(Some(pending_mint_rx)),
+            kagi_auth_token: kagi_auth_token.to_string(),
+            cost_per_xsr_cents,
+        }
+    }
+}
+
+/// Create a backing Cashu wallet instance.
+pub async fn create_backing_wallet(
+    mint_url: &str,
+    mnemonic: &str,
+    home_dir: &Path,
+) -> anyhow::Result<Arc<Wallet>> {
+    let mnemonic =
+        bip39::Mnemonic::parse(mnemonic).map_err(|e| anyhow::anyhow!("Invalid mnemonic: {}", e))?;
+    let seed = mnemonic.to_seed("");
+
+    let db_path = home_dir.join("cdk_wallet.sqlite");
+    let localstore = WalletSqliteDatabase::new(&db_path).await?;
+
+    let wallet = Wallet::new(
+        mint_url,
+        CurrencyUnit::Sat,
+        Arc::new(localstore),
+        seed,
+        None,
+    )?;
+
+    Ok(Arc::new(wallet))
+}
+
+#[async_trait]
+impl MintPayment for CashuWalletBackend {
+    type Err = cdk_common::payment::Error;
+
+    async fn get_settings(&self) -> Result<SettingsResponse, Self::Err> {
+        Ok(SettingsResponse {
+            unit: XSR_COMMON_UNIT.to_string(),
+            bolt11: Some(Bolt11Settings {
+                mpp: false,
+                amountless: false,
+                invoice_description: true,
+            }),
+            bolt12: None,
+            onchain: None,
+            custom: std::collections::HashMap::new(),
+        })
+    }
+
+    async fn create_incoming_payment_request(
+        &self,
+        options: IncomingPaymentOptions,
+    ) -> Result<CreateIncomingPaymentResponse, Self::Err> {
+        let amount = match options {
+            IncomingPaymentOptions::Bolt11(opts) => opts.amount,
+            _ => return Err(cdk_common::payment::Error::UnsupportedPaymentOption),
+        };
+        let unit = amount.unit().clone();
+
+        let usd_price = get_usd_price()
+            .await
+            .map_err(cdk_common::payment::Error::Lightning)?;
+        let msats = cents_to_msats(self.cost_per_xsr_cents * amount.clone().to_u64(), usd_price);
+
+        let amount_sats = Amount::new(msats, CurrencyUnit::Msat).convert_to(&CurrencyUnit::Sat)?;
+
+        let quote = self
+            .wallet
+            .mint_quote(
+                PaymentMethod::BOLT11,
+                Some(amount_sats.clone().into()),
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| cdk_common::payment::Error::Lightning(Box::new(e)))?;
+
+        let quote_id = quote.id.clone();
+        let quote_id_for_response = quote.id.clone();
+
+        let original_amount = amount.clone();
+
+        tracing::info!(
+            quote_id = %quote_id,
+            requested_amount_xsr = amount.clone().to_u64(),
+            invoice_amount_sats = amount_sats.clone().to_u64(),
+            expiry = quote.expiry,
+            "Created incoming mint quote"
+        );
+
+        let payment_info = IncomingPaymentInfo {
+            cost_sats: amount_sats.to_u64(),
+            amount_xsr: amount.to_u64(),
+        };
+        let value = serde_json::to_vec(&payment_info)?;
+
+        self.wallet
+            .localstore
+            .kv_write(
+                KV_PRIMARY_NAMESPACE,
+                KV_SECONDARY_NAMESPACE,
+                &quote_id,
+                &value,
+            )
+            .await
+            .map_err(|e| cdk_common::payment::Error::Lightning(Box::new(e)))?;
+
+        tracing::debug!(
+            quote_id = %quote_id,
+            cost_sats = payment_info.cost_sats,
+            amount_xsr = payment_info.amount_xsr,
+            "Stored incoming payment info in local KV"
+        );
+
+        let wallet = self.wallet.clone();
+
+        let expiry = Some(quote.expiry);
+        let request = quote.request.clone();
+
+        tracing::debug!(
+            quote_id = %quote_id,
+            timeout_secs = MINT_QUOTE_WAIT_TIMEOUT.as_secs(),
+            "Spawning incoming payment mint task"
+        );
+
+        let handle = tokio::spawn(async move {
+            tracing::debug!(
+                quote_id = %quote_id,
+                timeout_secs = MINT_QUOTE_WAIT_TIMEOUT.as_secs(),
+                "Waiting for incoming mint quote to become claimable"
+            );
+
+            let result = wallet
+                .wait_and_mint_quote(
+                    quote,
+                    Default::default(),
+                    Default::default(),
+                    MINT_QUOTE_WAIT_TIMEOUT,
+                )
+                .await;
+
+            match result {
+                Ok(_) => {
+                    let amount_u64 = original_amount.to_u64();
+                    tracing::info!(
+                        quote_id = %quote_id,
+                        amount_xsr = amount_u64,
+                        "Incoming payment mint task completed"
+                    );
+
+                    Some(WaitPaymentResponse {
+                        payment_identifier: PaymentIdentifier::CustomId(quote_id.clone()),
+                        payment_amount: CommonAmount::new(amount_u64, unit.clone()),
+                        payment_id: quote_id,
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(quote_id = %quote_id, error = %e, "Incoming payment mint task failed");
+                    None
+                }
+            }
+        });
+
+        let _ = self.pending_mint_tx.send(handle);
+
+        Ok(CreateIncomingPaymentResponse {
+            request_lookup_id: PaymentIdentifier::CustomId(quote_id_for_response),
+            request,
+            expiry,
+            extra_json: None,
+        })
+    }
+
+    async fn get_payment_quote(
+        &self,
+        _unit: &CommonCurrencyUnit,
+        _options: OutgoingPaymentOptions,
+    ) -> Result<PaymentQuoteResponse, Self::Err> {
+        Ok(PaymentQuoteResponse {
+            request_lookup_id: None,
+            amount: Amount::new(1, XSR_UNIT.clone()),
+            fee: Amount::new(0, XSR_UNIT.clone()),
+            state: cdk_common::MeltQuoteState::Unpaid,
+            extra_json: None,
+            estimated_blocks: None,
+            fee_options: None,
+        })
+    }
+
+    async fn make_payment(
+        &self,
+        _unit: &CommonCurrencyUnit,
+        options: OutgoingPaymentOptions,
+    ) -> Result<MakePaymentResponse, Self::Err> {
+        match options {
+            OutgoingPaymentOptions::Custom(options) => {
+                let response = reqwest::Client::new()
+                    .get("https://kagi.com/api/v0/search")
+                    .header(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bot {}", self.kagi_auth_token),
+                    )
+                    .query(&[("q", options.request)])
+                    .send()
+                    .await
+                    .map_err(|e| cdk_common::payment::Error::Lightning(Box::new(e)))?;
+
+                let json_response = response
+                    .json::<Value>()
+                    .await
+                    .map_err(|e| cdk_common::payment::Error::Lightning(Box::new(e)))?;
+
+                Ok(MakePaymentResponse {
+                    payment_lookup_id: PaymentIdentifier::CustomId(Uuid::new_v4().to_string()),
+                    payment_proof: Some(json_response.to_string()),
+                    status: cdk_common::MeltQuoteState::Paid,
+                    total_spent: Amount::new(1, XSR_UNIT.clone()),
+                })
+            }
+            _ => unimplemented!(),
+        }
+    }
+
+    async fn wait_payment_event(
+        &self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Event> + Send>>, Self::Err> {
+        if let Ok(unissued_quotes) = self.wallet.get_unissued_mint_quotes().await {
+            tracing::info!(
+                count = unissued_quotes.len(),
+                "Recovered unissued mint quotes on payment stream startup"
+            );
+
+            for quote in unissued_quotes {
+                let wallet = Arc::clone(&self.wallet);
+                let handle = tokio::spawn(async move {
+                    let quote_id = quote.id.clone();
+                    tracing::debug!(
+                        quote_id = %quote_id,
+                        timeout_secs = MINT_QUOTE_WAIT_TIMEOUT.as_secs(),
+                        "Retrying recovered unissued mint quote"
+                    );
+
+                    let result = wallet
+                        .wait_and_mint_quote(
+                            quote,
+                            Default::default(),
+                            Default::default(),
+                            MINT_QUOTE_WAIT_TIMEOUT,
+                        )
+                        .await;
+
+                    match result {
+                        Ok(_) => {
+                            tracing::info!(quote_id = %quote_id, "Recovered incoming payment mint task completed");
+
+                            let cost_info = wallet
+                                .localstore
+                                .kv_read(KV_PRIMARY_NAMESPACE, KV_SECONDARY_NAMESPACE, &quote_id)
+                                .await
+                                .map_err(|e| cdk_common::payment::Error::from(anyhow::anyhow!(e)))
+                                .ok()?
+                                .ok_or_else(|| {
+                                    cdk_common::payment::Error::from(anyhow::anyhow!(
+                                        "Missing payment info"
+                                    ))
+                                })
+                                .ok()?;
+
+                            let cost_info: IncomingPaymentInfo = serde_json::from_slice(&cost_info)
+                                .map_err(|e| cdk_common::payment::Error::from(anyhow::anyhow!(e)))
+                                .ok()?;
+
+                            Some(WaitPaymentResponse {
+                                payment_identifier: PaymentIdentifier::CustomId(quote_id.clone()),
+                                payment_amount: CommonAmount::new(
+                                    cost_info.amount_xsr,
+                                    XSR_COMMON_UNIT.clone(),
+                                ),
+                                payment_id: quote_id,
+                            })
+                        }
+                        Err(e) => {
+                            tracing::warn!(quote_id = %quote_id, error = %e, "Recovered incoming payment mint task failed");
+                            None
+                        }
+                    }
+                });
+
+                let _ = self.pending_mint_tx.send(handle);
+            }
+        }
+
+        let mut rx = self
+            .pending_mint_rx
+            .lock()
+            .expect("pending_mint_rx mutex poisoned")
+            .take()
+            .expect("wait_payment_event called more than once");
+
+        let s = stream! {
+            let mut pending: FuturesUnordered<JoinHandle<Option<WaitPaymentResponse>>> =
+                FuturesUnordered::new();
+
+            loop {
+                // If no futures are being tracked, wait for the first handle from the channel
+                if pending.is_empty() {
+                    match rx.recv().await {
+                        Some(handle) => {
+                            pending.push(handle);
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+
+                tokio::select! {
+                    // A spawned payment task completed
+                    Some(result) = pending.next() => {
+                        match result {
+                            Ok(Some(response)) => {
+                                tracing::info!(
+                                    payment_id = %response.payment_id,
+                                    amount = response.payment_amount.clone().to_u64(),
+                                    unit = %response.payment_amount.unit(),
+                                    "Emitting incoming payment received event"
+                                );
+                                yield Event::PaymentReceived(response);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Incoming payment task join failed");
+                            }
+                        }
+                    }
+                    // A new payment handle arrived from the channel
+                    recv_result = rx.recv() => {
+                        match recv_result {
+                            Some(handle) => pending.push(handle),
+                            None => {
+                                // Sender dropped — drain remaining futures
+                                while let Some(result) = pending.next().await {
+                                    match result {
+                                        Ok(Some(response)) => {
+                                            tracing::info!(
+                                                payment_id = %response.payment_id,
+                                                amount = response.payment_amount.clone().to_u64(),
+                                                unit = %response.payment_amount.unit(),
+                                                "Draining incoming payment received event"
+                                            );
+                                            yield Event::PaymentReceived(response);
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "Incoming payment task join failed while draining");
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok(Box::pin(s))
+    }
+
+    fn is_payment_event_stream_active(&self) -> bool {
+        self.wait_invoice_active.load(Ordering::Relaxed)
+    }
+
+    fn cancel_payment_event_stream(&self) {
+        self.wait_invoice_active.store(false, Ordering::Relaxed);
+    }
+
+    async fn check_incoming_payment_status(
+        &self,
+        payment_identifier: &PaymentIdentifier,
+    ) -> Result<Vec<WaitPaymentResponse>, Self::Err> {
+        let quote_id = match payment_identifier {
+            PaymentIdentifier::CustomId(id) => id,
+            _ => return Err(cdk_common::payment::Error::UnsupportedPaymentOption),
+        };
+
+        let mint_quote = self
+            .wallet
+            .check_mint_quote_status(quote_id)
+            .await
+            .map_err(|e| cdk_common::payment::Error::Lightning(Box::new(e)))?;
+
+        tracing::info!(
+            quote_id = %quote_id,
+            state = ?mint_quote.state,
+            amount = mint_quote.amount.map(|amount| amount.to_u64()),
+            expiry = mint_quote.expiry,
+            amount_paid = mint_quote.amount_paid.to_u64(),
+            amount_issued = mint_quote.amount_issued.to_u64(),
+            "Checked incoming payment status"
+        );
+
+        match mint_quote.state {
+            cdk::nuts::MintQuoteState::Paid => {
+                tracing::info!(quote_id = %quote_id, "Mint quote is paid; attempting to mint proofs");
+
+                let _receive_amount = self
+                    .wallet
+                    .mint(quote_id, SplitTarget::default(), None)
+                    .await
+                    .map_err(|e| cdk_common::payment::Error::Lightning(Box::new(e)))?;
+
+                tracing::info!(quote_id = %quote_id, "Minted proofs for paid incoming quote");
+
+                let cost_info = self
+                    .wallet
+                    .localstore
+                    .kv_read(KV_PRIMARY_NAMESPACE, KV_SECONDARY_NAMESPACE, quote_id)
+                    .await
+                    .map_err(|e| cdk_common::payment::Error::from(anyhow::anyhow!(e)))?
+                    .ok_or_else(|| {
+                        cdk_common::payment::Error::from(anyhow::anyhow!("Missing payment info"))
+                    })?;
+
+                let cost_info: IncomingPaymentInfo = serde_json::from_slice(&cost_info)
+                    .map_err(|e| cdk_common::payment::Error::from(anyhow::anyhow!(e)))?;
+
+                Ok(vec![WaitPaymentResponse {
+                    payment_identifier: payment_identifier.clone(),
+                    payment_amount: CommonAmount::new(
+                        cost_info.amount_xsr,
+                        XSR_COMMON_UNIT.clone(),
+                    ),
+                    payment_id: quote_id.clone(),
+                }])
+            }
+            cdk::nuts::MintQuoteState::Issued => {
+                tracing::info!(quote_id = %quote_id, "Mint quote already issued; returning success without re-minting");
+
+                let cost_info = self
+                    .wallet
+                    .localstore
+                    .kv_read(KV_PRIMARY_NAMESPACE, KV_SECONDARY_NAMESPACE, quote_id)
+                    .await
+                    .map_err(|e| cdk_common::payment::Error::from(anyhow::anyhow!(e)))?
+                    .ok_or_else(|| {
+                        cdk_common::payment::Error::from(anyhow::anyhow!("Missing payment info"))
+                    })?;
+
+                let cost_info: IncomingPaymentInfo = serde_json::from_slice(&cost_info)
+                    .map_err(|e| cdk_common::payment::Error::from(anyhow::anyhow!(e)))?;
+
+                Ok(vec![WaitPaymentResponse {
+                    payment_identifier: payment_identifier.clone(),
+                    payment_amount: CommonAmount::new(
+                        cost_info.amount_xsr,
+                        XSR_COMMON_UNIT.clone(),
+                    ),
+                    payment_id: quote_id.clone(),
+                }])
+            }
+            _ => {
+                tracing::debug!(quote_id = %quote_id, state = ?mint_quote.state, "Mint quote not yet payable to caller");
+                Ok(vec![])
+            }
+        }
+    }
+
+    async fn check_outgoing_payment(
+        &self,
+        _payment_identifier: &PaymentIdentifier,
+    ) -> Result<MakePaymentResponse, Self::Err> {
+        todo!("Implement check_outgoing_payment")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PriceResponse {
+    #[serde(rename = "USD")]
+    usd: u64,
+}
+
+pub async fn get_usd_price() -> Result<u64, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get("https://mempool.space/api/v1/prices")
+        .send()
+        .await?
+        .json::<PriceResponse>()
+        .await?;
+
+    Ok(response.usd)
+}
+
+pub fn cents_to_msats(cents: u64, btc_price_dollars: u64) -> u64 {
+    let bitcoin_price_cents = btc_price_dollars * 100;
+    let msats = (cents as u128 * 100_000_000_000u128) / bitcoin_price_cents as u128;
+    let rounded_sats = msats.div_ceil(1000);
+    let rounded_msats = rounded_sats * 1000;
+
+    rounded_msats as u64
+}

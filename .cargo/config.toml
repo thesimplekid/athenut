@@ -1,0 +1,4 @@
+# Default location of the Trunk-built frontend embedded into the binary when
+# Cargo is invoked from the workspace root.
+[env]
+FRONTEND_DIST = { value = "athenut-frontend/dist", relative = true }

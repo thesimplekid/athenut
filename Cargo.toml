@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+  "athenut-mint",
+  "athenut-frontend",
+]
+default-members = ["athenut-mint"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
