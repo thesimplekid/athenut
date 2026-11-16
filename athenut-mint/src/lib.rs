@@ -10,6 +10,7 @@ pub mod cdk_wallet;
 pub mod cli;
 pub mod config;
 pub mod frontend;
+mod kagi;
 pub mod mpp;
 pub mod search_route_handlers;
 

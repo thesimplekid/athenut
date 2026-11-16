@@ -313,14 +313,7 @@ async fn kagi_search(
 ) -> Result<Vec<SearchResult>, (StatusCode, HeaderMap, String)> {
     let time = unix_time();
 
-    let response = reqwest::Client::new()
-        .get("https://kagi.com/api/v0/search")
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bot {}", kagi_auth_token),
-        )
-        .query(&[("q", query)])
-        .send()
+    let json_response = crate::kagi::search(kagi_auth_token, query)
         .await
         .map_err(|e| {
             tracing::error!("Kagi request failed: {}", e);
@@ -331,15 +324,6 @@ async fn kagi_search(
             )
         })?;
 
-    let json_response: Value = response.json().await.map_err(|e| {
-        tracing::error!("Failed to parse Kagi response: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            HeaderMap::new(),
-            String::new(),
-        )
-    })?;
-
     let results: KagiSearchResponse = serde_json::from_value(json_response).map_err(|e| {
         tracing::error!("Invalid response from Kagi: {}", e);
         (
@@ -349,20 +333,8 @@ async fn kagi_search(
         )
     })?;
 
-    tracing::info!(
-        "Kagi search completed: {}ms from {}",
-        results.meta.ms,
-        results.meta.node
-    );
-
-    let search_results: Vec<SearchResult> = results
-        .data
-        .into_iter()
-        .flat_map(|s| match s {
-            KagiSearchObject::SearchResult(sr) => Some(sr.into()),
-            KagiSearchObject::RelatedSearches(_) => None,
-        })
-        .collect();
+    let search_results: Vec<SearchResult> =
+        results.data.search.into_iter().map(Into::into).collect();
 
     tracing::info!("Kagi total time: {}", unix_time() - time);
 
@@ -552,14 +524,17 @@ async fn handle_cashu_payment(
 
     tracing::info!("Kagi time: {}", unix_time() - time);
 
-    let json_response = melt_res.payment_proof().map(str::to_string).ok_or_else(|| {
-        tracing::error!("Melt response missing preimage");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            HeaderMap::new(),
-            String::new(),
-        )
-    })?;
+    let json_response = melt_res
+        .payment_proof()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            tracing::error!("Melt response missing preimage");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                HeaderMap::new(),
+                String::new(),
+            )
+        })?;
 
     let results: KagiSearchResponse = serde_json::from_str(&json_response).map_err(|_| {
         tracing::error!("Invalid response from kagi");
@@ -570,12 +545,6 @@ async fn handle_cashu_payment(
         )
     })?;
 
-    tracing::info!(
-        "fetched response: {} from {}",
-        results.meta.ms,
-        results.meta.node
-    );
-
     let mint_clone = Arc::clone(mint);
     tokio::spawn(async move {
         if let Err(err) = add_search(&mint_clone, PaymentMethod::Cashu).await {
@@ -583,14 +552,8 @@ async fn handle_cashu_payment(
         }
     });
 
-    let search_results: Vec<SearchResult> = results
-        .data
-        .into_iter()
-        .flat_map(|s| match s {
-            KagiSearchObject::SearchResult(sr) => Some(sr.into()),
-            KagiSearchObject::RelatedSearches(_) => None,
-        })
-        .collect();
+    let search_results: Vec<SearchResult> =
+        results.data.search.into_iter().map(Into::into).collect();
 
     Ok((StatusCode::OK, HeaderMap::new(), Json(search_results)))
 }
@@ -863,16 +826,13 @@ pub struct ApiState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct KagiSearchResponse {
-    meta: Meta,
-    data: Vec<KagiSearchObject>,
+    data: KagiSearchData,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Meta {
-    id: String,
-    node: String,
-    ms: u64,
-    api_balance: Option<f64>,
+struct KagiSearchData {
+    #[serde(default)]
+    search: Vec<KagiSearchResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -884,35 +844,11 @@ struct SearchResult {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-enum KagiSearchObject {
-    SearchResult(KagiSearchResult),
-    RelatedSearches(KagiRelatedSearches),
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 struct KagiSearchResult {
-    t: u8,
-    rank: Option<u64>,
     url: String,
     title: String,
     snippet: Option<String>,
-    published: Option<String>,
-    image: Option<Image>,
-    list: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
-struct Image {
-    url: String,
-    height: u64,
-    width: u64,
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
-struct KagiRelatedSearches {
-    t: u8,
-    list: Vec<String>,
+    time: Option<String>,
 }
 
 impl From<KagiSearchResult> for SearchResult {
@@ -921,7 +857,74 @@ impl From<KagiSearchResult> for SearchResult {
             url: kagi.url,
             title: kagi.title,
             description: kagi.snippet,
-            age: kagi.published,
+            age: kagi.time,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn kagi_v1_results_preserve_the_search_api_response() {
+        let response: KagiSearchResponse = serde_json::from_value(json!({
+            "meta": { "trace": "test-trace", "ms": 314, "node": "us-east4" },
+            "data": {
+                "search": [{
+                    "url": "https://example.com/article",
+                    "title": "Example article",
+                    "snippet": "An example result",
+                    "time": "2024-11-29T03:54:26Z",
+                    "image": { "url": "https://example.com/image.png" },
+                    "props": { "extra": "metadata" }
+                }],
+                "related_search": [{ "title": "Another query" }]
+            }
+        }))
+        .unwrap();
+
+        let results: Vec<SearchResult> = response.data.search.into_iter().map(Into::into).collect();
+        assert_eq!(
+            serde_json::to_value(results).unwrap(),
+            json!([{
+                "url": "https://example.com/article",
+                "title": "Example article",
+                "description": "An example result",
+                "age": "2024-11-29T03:54:26Z"
+            }])
+        );
+    }
+
+    #[test]
+    fn kagi_v1_results_allow_missing_optional_fields_and_debug_metadata() {
+        let response: KagiSearchResponse = serde_json::from_value(json!({
+            "data": { "search": [{ "url": "https://example.com", "title": "Example" }] }
+        }))
+        .unwrap();
+
+        let result: SearchResult = response.data.search.into_iter().next().unwrap().into();
+        assert_eq!(result.description, None);
+        assert_eq!(result.age, None);
+    }
+
+    #[test]
+    fn kagi_v1_results_allow_no_web_results() {
+        for data in [json!({ "search": [] }), json!({ "image": [] })] {
+            let response: KagiSearchResponse =
+                serde_json::from_value(json!({ "data": data })).unwrap();
+            assert!(response.data.search.is_empty());
+        }
+    }
+
+    #[test]
+    fn kagi_v1_errors_are_not_empty_search_results() {
+        for response in [
+            json!({ "error": [{ "code": "auth.invalid_token" }] }),
+            json!({ "data": null, "error": [{ "code": "auth.invalid_token" }] }),
+        ] {
+            assert!(serde_json::from_value::<KagiSearchResponse>(response).is_err());
         }
     }
 }

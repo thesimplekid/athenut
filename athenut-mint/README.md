@@ -8,6 +8,17 @@ This is the repository's native binary. In production it also serves the
 Leptos frontend from embedded Trunk assets, so the UI, Cashu mint protocol and
 search API are all available from the same origin.
 
+Kagi requests use the [v1 Search API](https://help.kagi.com/kagi/api/search.html)
+with the configured `search_settings.kagi_auth_token` as a Bearer token.
+Both payment paths send the query as JSON with safe search disabled:
+
+```bash
+curl https://kagi.com/api/v1/search \
+  -H "Authorization: Bearer $KAGI_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"test","filters":{"safe_search":false}}'
+```
+
 ## API Endpoints
 
 ### GET /info

@@ -15,7 +15,6 @@ use cdk_sqlite::WalletSqliteDatabase;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use futures_core::Stream;
-use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -276,19 +275,7 @@ impl MintPayment for CashuWalletBackend {
     ) -> Result<MakePaymentResponse, Self::Err> {
         match options {
             OutgoingPaymentOptions::Custom(options) => {
-                let response = reqwest::Client::new()
-                    .get("https://kagi.com/api/v0/search")
-                    .header(
-                        reqwest::header::AUTHORIZATION,
-                        format!("Bot {}", self.kagi_auth_token),
-                    )
-                    .query(&[("q", options.request)])
-                    .send()
-                    .await
-                    .map_err(|e| cdk_common::payment::Error::Lightning(Box::new(e)))?;
-
-                let json_response = response
-                    .json::<Value>()
+                let json_response = crate::kagi::search(&self.kagi_auth_token, &options.request)
                     .await
                     .map_err(|e| cdk_common::payment::Error::Lightning(Box::new(e)))?;
 
